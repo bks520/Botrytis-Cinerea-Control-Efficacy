@@ -1,0 +1,447 @@
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Conv2D, BatchNormalization, GlobalAvgPool2D, Activation, Multiply,
+    Add, Dense, Input
+)
+from tensorflow.keras.optimizers import Nadam
+from tensorflow.keras.callbacks import EarlyStopping
+import numpy as np
+import pandas as pd
+import shap
+import matplotlib.pyplot as plt
+import tensorflow as tf
+tf.autograph.set_verbosity(0)
+
+from tensorflow.keras.layers import Conv2D, Multiply, Add, GlobalAveragePooling2D, Reshape, Permute
+from tensorflow.keras.layers import Conv2D, Multiply, Add, GlobalAveragePooling2D, GlobalMaxPooling2D, Reshape, Dense, Permute
+
+from tensorflow.keras.layers import Concatenate
+import shap
+
+
+
+
+
+
+
+
+# Load and preprocess data
+df = pd.read_excel('C:\\Users\\zxs\\PycharmProjects\\transtab-main\\shujujizxs3.xlsx', sheet_name=0)
+data = df.iloc[:, 1:6].values
+scale = np.amax(data[:, -1])
+sep = int(0.75 * len(data))
+
+# Split the data into train and validation sets
+train_x = data[:sep, :5]
+train_y = data[:sep, -1] / scale
+validation_x = data[sep:, :5]
+validation_y = data[sep:, -1] / scale
+
+# ----------------- #
+# 图像数据处理
+# ----------------- #
+def convert_to_images(data, scale):
+    image_height = 224
+    image_width = 224
+    images = []
+
+    for row in data:
+        image = np.zeros((image_height, image_width, 4), dtype=np.uint8)
+        for i in range(4):  # 仅使用前4个特征为RGB通道赋值
+            pixel_value = int(row[i] * 255)
+            image[:, :, i] = pixel_value
+        intensity_value = int(row[-1] / scale * 255)
+        image[:, :, 3] = intensity_value  # 最后一个通道表示强度值
+        images.append(image)
+
+    return np.array(images)
+
+train_images = convert_to_images(train_x, scale)
+validation_images = convert_to_images(validation_x, scale)
+
+# Normalize data
+train_images = train_images / 255.0
+validation_images = validation_images / 255.0
+
+# # 绘制样本图像
+# sample_index = 0  # 更改为您想要显示的样本索引
+# sample_image = train_images[sample_index]
+# plt.imshow(sample_image)
+# plt.title(f"Sample Image - Label: {train_y[sample_index] * scale:.2f}")
+# plt.show()
+
+
+# ----------------- #
+# 卷积+标准化
+# ----------------- #
+def conv_bn(filters, kernel_size, strides, padding, groups=1):
+    def _conv_bn(x):
+        x = Conv2D(filters=filters, kernel_size=kernel_size, strides=strides,
+                   padding=padding, groups=groups, use_bias=False)(x)
+        x = BatchNormalization()(x)
+        return x
+
+    return _conv_bn
+
+# ----------------- #
+# CBAM模块
+# ----------------- #
+def SE_MHSA_block(x, se_r=16, num_heads=8):
+    # SE模块
+    se_channels = x.shape[-1]
+    se = GlobalAvgPool2D()(x)
+    se = Reshape((1, 1, se_channels))(se)
+    se = Conv2D(filters=se_channels // se_r, kernel_size=1, strides=1)(se)
+    se = Activation('relu')(se)
+    se = Conv2D(filters=se_channels, kernel_size=1, strides=1)(se)
+    se = Activation('sigmoid')(se)
+    x_se = Multiply()([x, se])
+
+    # Multi-Head Self-Attention模块
+    channels = x.shape[-1]
+    head_dim = channels // num_heads
+    heads = []
+    for i in range(num_heads):
+        head = Conv2D(filters=head_dim, kernel_size=1, strides=1, padding='same')(x)
+        heads.append(head)
+
+    f = Conv2D(filters=head_dim, kernel_size=1, strides=1, padding='same')(x)
+    g = Conv2D(filters=head_dim, kernel_size=1, strides=1, padding='same')(x)
+    h = Conv2D(filters=channels, kernel_size=1, strides=1, padding='same')(x)
+
+    s = Multiply()([g, h])
+    beta = Add()([f, s])
+    beta = Activation('softmax')(beta)
+
+    attended_heads = []
+    for i in range(num_heads):
+        attended_head = Multiply()([beta, heads[i]])
+        attended_head = Conv2D(filters=channels // num_heads, kernel_size=1, strides=1, padding='same')(attended_head)
+        attended_heads.append(attended_head)
+
+    attended_features = Add()(attended_heads)
+    x_mhsa = Add()([x, attended_features])
+
+    # 合并SE和Multi-Head Self-Attention模块
+    x_combined = Add()([x_se, x_mhsa])
+
+    return x_combined
+
+
+
+# ----------------- #
+# RepVGG模块的堆叠
+# ----------------- #
+def make_stage(planes, num_blocks, stride_1, deploy, use_se, override_groups_map=None):
+    def _make_stage(x):
+        cur_layer_id = 1
+        strides = [stride_1] + [1] * (num_blocks - 1)
+        for stride in strides:
+            cur_groups = override_groups_map.get(cur_layer_id, 1)
+            x = RepVGGBlock(filters=planes, kernel_size=3, strides=stride, padding='same',
+                            groups=cur_groups, deploy=deploy, use_se=use_se)(x)
+            cur_layer_id += 1
+        return x
+
+    return _make_stage
+
+# ----------------- #
+# RepVGG模块
+# ----------------- #
+def RepVGGBlock(filters, kernel_size, strides=1, padding='valid', dilation=1, groups=1, deploy=False, use_se=False):
+    def _RepVGGBlock(inputs):
+        if deploy:
+            if use_se:
+                x = SE_MHSA_block(inputs)  # 使用CBAM模块替代SE模块
+                x = Conv2D(filters=filters, kernel_size=kernel_size, strides=strides,
+                           padding=padding, dilation_rate=dilation, groups=groups, use_bias=True)(x)
+                x = Activation('relu')(x)
+            else:
+                x = Conv2D(filters=filters, kernel_size=kernel_size, strides=strides,
+                           padding=padding, dilation_rate=dilation, groups=groups, use_bias=True)(inputs)
+                x = SE_MHSA_block(x)  # 使用CBAM模块替代SE模块
+                x = Activation('relu')(x)
+            return x
+
+
+
+
+        if inputs.shape[-1] == filters and strides == 1:
+            if use_se:
+                id_out = BatchNormalization()(inputs)
+                x1 = conv_bn(filters=filters, kernel_size=kernel_size, strides=strides, padding=padding, groups=groups)(
+                    inputs)
+                x2 = conv_bn(filters=filters, kernel_size=1, strides=strides, padding=padding, groups=groups)(inputs)
+                x3 = Add()([id_out, x1, x2])
+                x4 = SE_MHSA_block(x3)
+                return Activation('relu')(x4)
+            else:
+                id_out = BatchNormalization()(inputs)
+                x1 = conv_bn(filters=filters, kernel_size=kernel_size, strides=strides, padding=padding, groups=groups)(
+                    inputs)
+                x2 = conv_bn(filters=filters, kernel_size=1, strides=strides, padding=padding, groups=groups)(inputs)
+                x3 = Add()([id_out, x1, x2])
+                return Activation('relu')(x3)
+        else:
+            if use_se:
+
+                x1 = conv_bn(filters=filters, kernel_size=kernel_size, strides=strides, padding=padding, groups=groups)(
+                    inputs)
+                x2 = conv_bn(filters=filters, kernel_size=1, strides=strides, padding='valid', groups=groups)(inputs)
+                x3 = Add()([x1, x2])
+                x4 = SE_MHSA_block(x3)
+                return Activation('relu')(x4)
+            else:
+                x1 = conv_bn(filters=filters, kernel_size=kernel_size, strides=strides, padding=padding, groups=groups)(
+                    inputs)
+                x2 = conv_bn(filters=filters, kernel_size=1, strides=strides, padding='valid', groups=groups)(inputs)
+                x3 = Add()([x1, x2])
+
+                return Activation('relu')(x3)
+
+    return _RepVGGBlock
+
+
+
+
+
+
+# ----------------- #
+# RepVGG网络
+# ----------------- #
+# 在RepVGG模型中添加多尺度特征提取器
+def RepVGG(x, num_blocks, classes=1000, width_multiplier=None, override_groups_map=None, deploy=False, use_se=False):
+    override_groups_map = override_groups_map or dict()
+    in_planes = min(64, int(64 * width_multiplier[0]))
+    out = RepVGGBlock(filters=in_planes, kernel_size=3, strides=2, padding='same', deploy=deploy, use_se=use_se)(x)
+
+    # 添加多尺度特征提取器
+    large_scale_features = make_stage(int(64 * width_multiplier[0]), num_blocks[0], stride_1=2, deploy=deploy,
+                                      use_se=use_se,
+                                      override_groups_map=override_groups_map)(out)
+    medium_scale_features = make_stage(int(128 * width_multiplier[1]), num_blocks[1], stride_1=2, deploy=deploy,
+                                       use_se=use_se,
+                                       override_groups_map=override_groups_map)(large_scale_features)
+    small_scale_features = make_stage(int(256 * width_multiplier[2]), num_blocks[2], stride_1=2, deploy=deploy,
+                                      use_se=use_se,
+                                      override_groups_map=override_groups_map)(medium_scale_features)
+
+    # 融合多尺度特征
+    fused_features = Concatenate()([large_scale_features, medium_scale_features, small_scale_features])
+
+    out = make_stage(int(512 * width_multiplier[3]), num_blocks[3], stride_1=2, deploy=deploy, use_se=use_se,
+                     override_groups_map=override_groups_map)(fused_features)
+    out = GlobalAvgPool2D()(out)
+    out = Dense(classes)(out)
+    return out
+
+
+optional_groupwise_layers = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26]
+g2_map = {l: 2 for l in optional_groupwise_layers}
+g4_map = {l: 4 for l in optional_groupwise_layers}
+
+
+def RepVGG_A0(inputs, classes=1000, deploy=False):
+    return RepVGG(inputs, num_blocks=[2, 4, 14, 1], classes=classes,
+                  width_multiplier=[0.75, 0.75, 0.75, 2.5], override_groups_map=None, deploy=deploy)
+
+
+def create_RepVGG_A1(x, deploy=False):
+    return RepVGG(x, num_blocks=[2, 4, 14, 1], classes=1000,
+                  width_multiplier=[1, 1, 1, 2.5], override_groups_map=None, deploy=deploy)
+
+
+def create_RepVGG_A2(x, deploy=False):
+    return RepVGG(x, num_blocks=[2, 4, 14, 1], num_classes=1000,
+                  width_multiplier=[1.5, 1.5, 1.5, 2.75], override_groups_map=None, deploy=deploy)
+
+
+def create_RepVGG_B0(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], classes=1000,
+                  width_multiplier=[1, 1, 1, 2.5], override_groups_map=None, deploy=deploy)
+
+
+def create_RepVGG_B1(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], num_classes=1000,
+                  width_multiplier=[2, 2, 2, 4], override_groups_map=None, deploy=deploy)
+
+
+def create_RepVGG_B1g2(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], num_classes=1000,
+                  width_multiplier=[2, 2, 2, 4], override_groups_map=g2_map, deploy=deploy)
+
+
+def create_RepVGG_B1g4(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], num_classes=1000,
+                  width_multiplier=[2, 2, 2, 4], override_groups_map=g4_map, deploy=deploy)
+
+
+def create_RepVGG_B2(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], num_classes=1000,
+                  width_multiplier=[2.5, 2.5, 2.5, 5], override_groups_map=None, deploy=deploy)
+
+
+def create_RepVGG_B2g2(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], num_classes=1000,
+                  width_multiplier=[2.5, 2.5, 2.5, 5], override_groups_map=g2_map, deploy=deploy)
+
+
+def create_RepVGG_B2g4(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], num_classes=1000,
+                  width_multiplier=[2.5, 2.5, 2.5, 5], override_groups_map=g4_map, deploy=deploy)
+
+
+def create_RepVGG_B3(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], num_classes=1000,
+                  width_multiplier=[3, 3, 3, 5], override_groups_map=None, deploy=deploy)
+
+
+def create_RepVGG_B3g2(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], num_classes=1000,
+                  width_multiplier=[3, 3, 3, 5], override_groups_map=g2_map, deploy=deploy)
+
+
+def create_RepVGG_B3g4(x, deploy=False):
+    return RepVGG(x, num_blocks=[4, 6, 16, 1], num_classes=1000,
+                  width_multiplier=[3, 3, 3, 5], override_groups_map=g4_map, deploy=deploy)
+
+
+def create_RepVGG_D2se(x, deploy=False):
+    return RepVGG(x, num_blocks=[8, 14, 24, 1], num_classes=1000,
+                  width_multiplier=[2.5, 2.5, 2.5, 5], override_groups_map=None, deploy=deploy, use_se=True)
+
+
+if __name__ == '__main__':
+    inputs = Input(shape=(1, 1, 5))
+
+    classes = 1000
+    model = Model(inputs=inputs, outputs=RepVGG_A0(inputs))
+    model.summary()
+
+    # Compile the model
+    model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+
+# Reshape data for RepVGG input
+train_x_reshaped = train_x.reshape(train_x.shape[0], 1, 1, 5)
+validation_x_reshaped = validation_x.reshape(validation_x.shape[0], 1, 1, 5)
+
+
+
+
+
+
+# Normalize data
+train_x_reshaped = train_x_reshaped / 255.0
+validation_x_reshaped = validation_x_reshaped / 255.0
+
+
+
+
+# Train the model
+patience = 10
+# early_stopping = EarlyStopping(monitor='val_loss', patience=patience, verbose=2)
+hist = model.fit(train_x_reshaped, train_y, epochs=2, batch_size=4, validation_data=(validation_x_reshaped, validation_y),
+                 verbose=2, shuffle=True, )
+from tensorflow.keras.optimizers import Adam
+
+learning_rate = 0.000001  # 设置您想要的学习率
+optimizer = Adam(learning_rate=learning_rate)
+
+model.compile(optimizer=optimizer, loss='mean_squared_error', metrics=['mae'])
+
+import tensorflow as tf
+
+import tensorflow as tf
+
+# 在创建 TensorFlow 会话之前设置内存增长策略
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+# 创建 TensorFlow 会话或模型等
+# ...
+
+
+
+# callbacks=[early_stopping]
+
+
+
+import shap
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input
+
+# 导入您的模型和数据
+model = Model(inputs=inputs, outputs=RepVGG_A0(inputs))  # 你的模型
+train_x_reshaped = train_images  # 训练数据
+
+# 创建SHAP解释器
+explainer = shap.GradientExplainer(model, train_x_reshaped)
+
+# 假设您想解释第一个训练样本的预测结果
+sample_index = 0
+
+# 获取该样本的SHAP值
+shap_values = explainer.shap_values(train_x_reshaped)
+
+# 可视化SHAP值
+shap.initjs()
+shap.force_plot(explainer.expected_value[0], shap_values[0], train_x_reshaped[sample_index])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import matplotlib.pyplot as plt
+
+# print("Validation Ground Truth Labels:")
+# print(train_y)
+
+
+# Get loss and mae history
+loss_history = hist.history['loss']
+val_loss_history = hist.history['val_loss']
+mae_history = hist.history['mae']
+val_mae_history = hist.history['val_mae']
+
+# Plot loss
+plt.figure(figsize=(12, 6))
+plt.subplot(1, 2, 1)
+plt.plot(loss_history, label='Training Loss')
+plt.plot(val_loss_history, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss')
+plt.legend()
+
+# Plot MAE
+plt.subplot(1, 2, 2)
+plt.plot(mae_history, label='Training MAE')
+plt.plot(val_mae_history, label='Validation MAE')
+plt.xlabel('Epoch')
+plt.ylabel('MAE')
+plt.title('Training and Validation MAE')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+
+
+
+

@@ -1,0 +1,1 @@
+{"categorical": ["credit_history", "own_telephone", "foreign_worker", "savings_status", "purpose", "employment", "personal_status", "housing", "property_magnitude", "job", "other_parties", "checking_status", "other_payment_plans"], "binary": [], "numerical": ["credit_amount", "age", "residence_since", "duration", "installment_commitment", "existing_credits", "num_dependents"]}
